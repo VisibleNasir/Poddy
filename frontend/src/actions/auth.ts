@@ -1,7 +1,8 @@
+
 "use server";
 
 import { hashPassword } from "~/lib/auth";
-import { signupSchema, type SignupFormValues } from "~/schemas/auth";
+import { signupSchema } from "~/schemas/auth";
 import { db } from "~/server/db";
 import Stripe from "stripe";
 import { env } from "~/env";
@@ -10,6 +11,10 @@ type SignupResult = {
   success: boolean;
   error?: string;
 };
+type SignupFormValues = {
+    email : string,
+    password : string
+} 
 
 export async function signUp(data: SignupFormValues): Promise<SignupResult> {
   const validationResult = signupSchema.safeParse(data);
