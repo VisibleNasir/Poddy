@@ -14,7 +14,8 @@ type SignupResult = {
 type SignupFormValues = {
     email : string,
     password : string
-}
+} 
+
 export async function signUp(data: SignupFormValues): Promise<SignupResult> {
   const validationResult = signupSchema.safeParse(data);
   if (!validationResult.success) {
