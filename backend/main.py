@@ -21,11 +21,15 @@ from tqdm import tqdm
 import whisperx
 import pickle
 from google import genai
+import difflib
 
 
 class ProcessVideoRequest(BaseModel):
     s3_key: str
 
+
+class BurnSubtitlesRequest(BaseModel):
+    s3_key: str
 
 
 image = (modal.Image.from_registry(
@@ -333,6 +337,18 @@ def create_subtitles_with_ffmpeg(transcript_segments: list, clip_start: float, c
                      and segment.get("end") is not None
                      and segment.get("end") > clip_start
                      and segment.get("start") < clip_end]
+    
+    def is_repetitive_or_gibberish(text: str) -> bool:
+        words = text.strip().split()
+        if len(words) <= 2 and len(text) <= 3:  # Skip very short or single-character text
+            return True
+        if len(words) >= 5 and len(set(words)) == 1:  # Skip if 5+ words are identical
+            return True
+        if not any(c.isascii() for c in text):
+            return True
+        return False
+
+    clip_segments = [seg for seg in clip_segments if not is_repetitive_or_gibberish(seg.get("word", ""))]
 
     subtitles = []
     current_words = []
@@ -512,14 +528,21 @@ class AiPodcastClipper:
 
     def transcribe_video(self, base_dir: str, video_path: str):
         audio_path = base_dir / "audio.wav"
-        extract_cmd = f"ffmpeg -i {video_path} -vn -acodec pcm_s16le -ar 16000 -ac 1 {audio_path}"
+        extract_cmd = f"ffmpeg -i {video_path} -vn -acodec pcm_s16le -ar 16000 -ac 1 -af 'highpass=f=200, volume=2 ' {audio_path}"
         subprocess.run(extract_cmd, shell=True,
                        check=True, capture_output=True)
 
         print("Starting transcription with whisperx...")
         start_time = time.time()
         audio = whisperx.load_audio(str(audio_path))
-        result = self.whisperx_model.transcribe(audio, batch_size=16)
+        try:
+            result = self.whisperx_model.transcribe(audio, batch_size=16 , language="en")
+        except Exception as e:
+            print(f"Transcription with large-v2 failed: {e}, falling back to medium-en")
+            fallback_model = whisperx.load_model(
+                "medium-en", device="cuda", compute_type="float16")
+            result = fallback_model.transcribe(audio, batch_size=16, language="en")
+
         result = whisperx.align(result["segments"], self.alignment_model,
                                 self.metadata, audio, device="cuda", return_char_alignments=False)
         duration = time.time() - start_time
@@ -621,7 +644,7 @@ The transcript is as follows:\n\n
 
         print(f"Identified clip moments: {clip_moments}")
 
-        for index, moment in enumerate(clip_moments[:3]):
+        for index, moment in enumerate(clip_moments[:1]):
             if "start" in moment and "end" in moment:
                 print(
                     f"Processing clip {index} from {moment['start']} to {moment['end']}")
@@ -632,18 +655,86 @@ The transcript is as follows:\n\n
             print(f"Cleaning up temp dir after {base_dir}")
             shutil.rmtree(base_dir, ignore_errors=True)
 
-   
+    @modal.fastapi_endpoint(method="POST")
+    def burn_subtitles(self, request: BurnSubtitlesRequest, token: HTTPAuthorizationCredentials = Depends(auth_scheme)):
+        s3_key = request.s3_key
+
+        # Authentication
+        if token.credentials != os.environ["AUTH_TOKEN"]:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                                detail="Invalid or missing token", headers={"WWW-Authenticate": "Bearer"})
+
+        run_id = str(uuid.uuid4())
+        base_dir = pathlib.Path("/tmp") / run_id
+        base_dir.mkdir(parents=True, exist_ok=True)
+        video_path = base_dir / "input.mp4"
+        subtitle_output_path = base_dir / "video_with_subtitles.mp4"
+
+        # Download video from s3
+        s3_client = boto3.client("s3")
+        if not S3_BUCKET:
+            raise HTTPException(
+                status_code=500, detail="Server S3 configuration error: S3_BUCKET is not set or invalid")
+        try:
+            bucket_to_use = _normalize_and_validate_bucket(str(S3_BUCKET))
+            print(
+                f"Attempting S3 download: bucket={bucket_to_use}, key={s3_key}")
+            s3_client.download_file(bucket_to_use, s3_key, str(video_path))
+        except ParamValidationError as e:
+            print(f"S3 parameter validation error for bucket={S3_BUCKET}: {e}")
+            raise HTTPException(
+                status_code=500, detail=f"Invalid S3 bucket name: {S3_BUCKET}")
+        except ClientError as e:
+            err_code = e.response.get("Error", {}).get(
+                "Code") if hasattr(e, 'response') else None
+            print(
+                f"S3 download failed for key={s3_key} from bucket={S3_BUCKET}: {e}")
+            if err_code in ("404", "NoSuchKey"):
+                raise HTTPException(
+                    status_code=404, detail="S3 object not found")
+            if err_code in ("403", "AccessDenied"):
+                raise HTTPException(
+                    status_code=403, detail="Access denied to S3 object")
+            raise HTTPException(
+                status_code=500, detail=f"S3 download error: {e}")
+
+        # Transcribe Video
+        transcript_segments_json = self.transcribe_video(base_dir, video_path)
+        transcript_segments = json.loads(transcript_segments_json)
+        if not transcript_segments:
+            raise HTTPException(status_code=400, detail="No transcript segments generated")
+
+        probe = subprocess.run(f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {video_path}",shell=True, capture_output=True, text=True, check=True
+        )
+
+        video_duration = float(probe.stdout.strip())
+        # Burn subtitles
+        create_subtitles_with_ffmpeg(transcript_segments=transcript_segments, clip_start=0.0, clip_end=video_duration, clip_video_path=video_path, output_path=subtitle_output_path, max_words=5)
+        # Upload to S3
+        s3_key_dir=os.path.dirname(request.s3_key)
+        output_s3_key=f"{s3_key_dir}/{os.path.basename(request.s3_key).replace('.mp4', '_with_subtitles.mp4')}"
+        try:
+            s3_client.upload_file(str(subtitle_output_path), S3_BUCKET, output_s3_key)
+        except ClientError as e:
+            raise HTTPException(status_code=500, detail=f"S3 upload failed: {e}")
+        
+        if base_dir.exists():
+            shutil.rmtree(base_dir, ignore_errors=True)
+        # return response
+        
+        return {"output_s3_key": output_s3_key}
 
 
 @ app.local_entrypoint()
 def main():
+    code_time = time.time()
     import requests
 
     ai_podcast_clipper=AiPodcastClipper()
-    url=ai_podcast_clipper.process_video.web_url
+    url=ai_podcast_clipper.burn_subtitles.web_url
 
     payload={
-        "s3_key": "test1/podcast1.mp4"
+        "s3_key": "test2/vlog1.mp4"
     }
 
     headers={
@@ -655,3 +746,4 @@ def main():
     response.raise_for_status()
     result=response.json()
     print(result)
+    print(f"Total time: {time.time()-code_time:.2f} seconds")
